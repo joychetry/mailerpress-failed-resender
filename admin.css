@@ -264,3 +264,52 @@
 	float: none;
 	margin: 0;
 }
+
+/* Hide button */
+.mpfr-btn--hide {
+    color: #dba617;
+}
+.mpfr-btn--hide .dashicons {
+    color: #dba617;
+}
+.mpfr-btn--hide:hover .dashicons {
+    color: #d63638;
+}
+.mpfr-btn--hide:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+/* Show Hidden toggle */
+.mpfr-show-hidden {
+    margin-left: 8px;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+.mpfr-show-hidden .dashicons {
+    font-size: 16px;
+    width: 16px;
+    height: 16px;
+    line-height: 1;
+}
+.mpfr-show-hidden--active {
+    background: #f0f6fc;
+    border-color: #2271b1;
+    color: #2271b1;
+}
+
+/* Row animations */
+.mpfr-row--hidden {
+    display: none;
+}
+.mpfr-row--fading {
+    transition: opacity 0.3s ease;
+    opacity: 0;
+}
+
+/* Status message for hide action */
+.mpfr-status--hide {
+    border-left-color: #dba617;
+    background: #fcf9e8;
+}
