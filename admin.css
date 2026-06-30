@@ -81,7 +81,7 @@
 	font-size: 16px;
 	width: 16px;
 	height: 16px;
-	line-height: 1.5;
+	line-height: 1;
 }
 
 .mpfr-wrap .mpfr-loading,
@@ -146,12 +146,12 @@
 	top: 80px;
 	right: 24px;
 	width: 360px;
-	max-width: calc( 100vw - 48px );
+	max-width: calc(100vw - 48px);
 	background: #fff;
 	border: 1px solid #c3c4c7;
 	border-left: 4px solid #2271b1;
 	border-radius: 4px;
-	box-shadow: 0 6px 18px rgba( 0, 0, 0, 0.18 );
+	box-shadow: 0 6px 18px rgba(0, 0, 0, 0.18);
 	padding: 12px 14px;
 	z-index: 99999;
 	font-size: 13px;
@@ -207,7 +207,7 @@
 
 .mpfr-progress-fill {
 	height: 100%;
-	background: linear-gradient( 90deg, #2271b1, #00a32a );
+	background: linear-gradient(90deg, #2271b1, #00a32a);
 	width: 0;
 	transition: width 0.3s ease;
 }
