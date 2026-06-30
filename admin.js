@@ -32,6 +32,11 @@
 
 	apiFetch.use( apiFetch.createNonceMiddleware( data.nonce ) );
 
+	// Hidden campaigns state
+	var hiddenCampaigns = [];
+	var showHiddenActive = false;
+	var elShowHidden = null;
+
 	// ------------------------------------------------------------------
 	// Status banner
 	// ------------------------------------------------------------------
@@ -86,6 +91,130 @@
 		var skipped  = parseInt( progress.skipped,  10 ) || 0;
 		var done     = sent + failed + skipped;
 		return Math.min( 100, Math.round( ( done / total ) * 100 ) );
+	}
+
+	// ------------------------------------------------------------------
+	// Hidden campaigns
+	// ------------------------------------------------------------------
+	function loadHiddenCampaigns() {
+		return apiFetch( { path: '/mpfr/v1/user/hidden-campaigns' } )
+			.then( function ( response ) {
+				hiddenCampaigns = response.hidden_campaigns || [];
+				updateShowHiddenButton();
+				applyHiddenState();
+			} )
+			.catch( function ( err ) {
+				console.error( 'Failed to load hidden campaigns:', err );
+			} );
+	}
+
+	function hideCampaign( campaignId, btn ) {
+		if ( ! campaignId ) {
+			setStatus( 'error', __( 'Invalid campaign id.', 'mpfr' ) );
+			return;
+		}
+		
+		setBusy( btn, true, __( 'Hiding...', 'mpfr' ) );
+		
+		apiFetch( {
+			path: '/mpfr/v1/user/hidden-campaigns',
+			method: 'POST',
+			data: { action: 'add', campaign_id: campaignId }
+		} )
+			.then( function ( response ) {
+				if ( ! response || ! response.success ) {
+					throw new Error( ( response && response.message ) || 'Failed to hide campaign' );
+				}
+				
+				hiddenCampaigns = response.hidden_campaigns || [];
+				
+				// Find the row and animate it out
+				var row = elTbody.querySelector( 'tr[data-campaign="' + campaignId + '"]' );
+				if ( row ) {
+					row.classList.add( 'mpfr-row--fading' );
+					setTimeout( function () {
+						row.classList.add( 'mpfr-row--hidden' );
+						row.classList.remove( 'mpfr-row--fading' );
+					}, 300 );
+				}
+				
+				updateShowHiddenButton();
+				setStatus( 'info', __( 'Campaign hidden.', 'mpfr' ) );
+			} )
+			.catch( function ( err ) {
+				setStatus( 'error', sprintf( __( 'Failed to hide: %s', 'mpfr' ), ( err && err.message ) || 'unknown' ) );
+			} )
+			.finally( function () {
+				setBusy( btn, false );
+			} );
+	}
+
+	function toggleShowHidden() {
+		showHiddenActive = !showHiddenActive;
+		
+		if ( showHiddenActive ) {
+			// Show hidden rows
+			var hiddenRows = elTbody.querySelectorAll( 'tr.mpfr-row--hidden' );
+			for ( var i = 0; i < hiddenRows.length; i++ ) {
+				hiddenRows[i].classList.remove( 'mpfr-row--hidden' );
+				hiddenRows[i].classList.add( 'mpfr-row--fading' );
+				( function ( row ) {
+					setTimeout( function () {
+						row.classList.remove( 'mpfr-row--fading' );
+					}, 30 );
+				} )( hiddenRows[i] );
+			}
+		} else {
+			// Hide hidden rows again
+			applyHiddenState();
+		}
+		
+		updateShowHiddenButton();
+	}
+
+	function updateShowHiddenButton() {
+		if ( ! elShowHidden ) {
+			elShowHidden = document.getElementById( 'mpfr-show-hidden' );
+		}
+		
+		if ( ! elShowHidden ) {
+			// Create the button if it doesn't exist
+			elShowHidden = document.createElement( 'button' );
+			elShowHidden.type = 'button';
+			elShowHidden.className = 'page-title-action mpfr-btn mpfr-btn--show-hidden';
+			elShowHidden.id = 'mpfr-show-hidden';
+			elShowHidden.innerHTML = '<span class="dashicons dashicons-hidden" aria-hidden="true"></span> ' + __( 'Show Hidden', 'mpfr' );
+			elShowHidden.addEventListener( 'click', toggleShowHidden );
+			
+			// Insert after refresh button
+			if ( elRefresh && elRefresh.parentNode ) {
+				elRefresh.parentNode.insertBefore( elShowHidden, elRefresh.nextSibling );
+			}
+		}
+		
+		var count = hiddenCampaigns.length;
+		var buttonText = showHiddenActive ? __( 'Hide Hidden', 'mpfr' ) : __( 'Show Hidden', 'mpfr' );
+		var countText = count > 0 ? ' (' + count + ')' : '';
+		
+		elShowHidden.innerHTML = '<span class="dashicons dashicons-hidden" aria-hidden="true"></span> ' + buttonText + countText;
+		elShowHidden.style.display = count > 0 ? '' : 'none';
+		
+		if ( showHiddenActive ) {
+			elShowHidden.classList.add( 'mpfr-show-hidden--active' );
+		} else {
+			elShowHidden.classList.remove( 'mpfr-show-hidden--active' );
+		}
+	}
+
+	function applyHiddenState() {
+		if ( ! showHiddenActive && hiddenCampaigns.length > 0 ) {
+			for ( var i = 0; i < hiddenCampaigns.length; i++ ) {
+				var row = elTbody.querySelector( 'tr[data-campaign="' + hiddenCampaigns[i] + '"]' );
+				if ( row ) {
+					row.classList.add( 'mpfr-row--hidden' );
+				}
+			}
+		}
 	}
 
 	// ------------------------------------------------------------------
@@ -358,6 +487,10 @@
 						'</button> ',
 						'<button type="button" class="button mpfr-btn mpfr-btn--reset" data-batch="', batchPk, '">',
 							esc( __( 'Reset Chunks', 'mpfr' ) ),
+						'</button> ',
+						'<button type="button" class="button button-secondary mpfr-btn mpfr-btn--hide" data-campaign="', campaignId, '">',
+							'<span class="dashicons dashicons-visibility" aria-hidden="true"></span> ',
+							esc( __( 'Hide', 'mpfr' ) ),
 						'</button>',
 					'</td>',
 				'</tr>'
@@ -372,6 +505,8 @@
 				if ( elStatus ) {
 					elStatus.hidden = true;
 				}
+				// Apply hidden state after rendering rows
+				return loadHiddenCampaigns();
 			} )
 			.catch( function ( err ) {
 				elTbody.innerHTML = '<tr><td colspan="8" class="mpfr-error">' +
@@ -407,6 +542,9 @@
 			runResend( btn );
 		} else if ( btn.classList.contains( 'mpfr-btn--reset' ) ) {
 			runChunkReset( btn );
+		} else if ( btn.classList.contains( 'mpfr-btn--hide' ) ) {
+			var campaignId = parseInt( btn.dataset.campaign, 10 );
+			hideCampaign( campaignId, btn );
 		}
 	} );
 
@@ -436,6 +574,8 @@
 					} )
 					.catch( function () {} );
 			} );
+			// Also load hidden campaigns state
+			return loadHiddenCampaigns();
 		} )
 		.catch( function () {} );
 } )( window.wp, document );
