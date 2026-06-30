@@ -300,11 +300,13 @@
 }
 
 /* Row animations */
+.mpfr-table tbody tr {
+    transition: opacity 0.3s ease;
+}
 .mpfr-row--hidden {
     display: none;
 }
 .mpfr-row--fading {
-    transition: opacity 0.3s ease;
     opacity: 0;
 }
 

@@ -114,35 +114,51 @@
 			return;
 		}
 		
-		setBusy( btn, true, __( 'Hiding...', 'mpfr' ) );
+		// Determine if we're hiding or unhiding
+		var isCurrentlyHidden = hiddenCampaigns.indexOf( campaignId ) !== -1;
+		var action = isCurrentlyHidden ? 'remove' : 'add';
+		var busyLabel = isCurrentlyHidden ? __( 'Unhiding...', 'mpfr' ) : __( 'Hiding...', 'mpfr' );
+		
+		setBusy( btn, true, busyLabel );
 		
 		apiFetch( {
 			path: '/mpfr/v1/user/hidden-campaigns',
 			method: 'POST',
-			data: { action: 'add', campaign_id: campaignId }
+			data: { action: action, campaign_id: campaignId }
 		} )
 			.then( function ( response ) {
 				if ( ! response || ! response.success ) {
-					throw new Error( ( response && response.message ) || 'Failed to hide campaign' );
+					throw new Error( ( response && response.message ) || 'Failed to update campaign visibility' );
 				}
 				
 				hiddenCampaigns = response.hidden_campaigns || [];
 				
-				// Find the row and animate it out
+				// Find the row and animate it
 				var row = elTbody.querySelector( 'tr[data-campaign="' + campaignId + '"]' );
 				if ( row ) {
-					row.classList.add( 'mpfr-row--fading' );
-					setTimeout( function () {
-						row.classList.add( 'mpfr-row--hidden' );
-						row.classList.remove( 'mpfr-row--fading' );
-					}, 300 );
+					if ( isCurrentlyHidden ) {
+						// Unhiding: show the row
+						row.classList.remove( 'mpfr-row--hidden' );
+						row.classList.add( 'mpfr-row--fading' );
+						setTimeout( function () {
+							row.classList.remove( 'mpfr-row--fading' );
+						}, 30 );
+					} else {
+						// Hiding: hide the row
+						row.classList.add( 'mpfr-row--fading' );
+						setTimeout( function () {
+							row.classList.add( 'mpfr-row--hidden' );
+							row.classList.remove( 'mpfr-row--fading' );
+						}, 300 );
+					}
 				}
 				
 				updateShowHiddenButton();
-				setStatus( 'info', __( 'Campaign hidden.', 'mpfr' ) );
+				var statusMessage = isCurrentlyHidden ? __( 'Campaign unhidden.', 'mpfr' ) : __( 'Campaign hidden.', 'mpfr' );
+				setStatus( 'info', statusMessage );
 			} )
 			.catch( function ( err ) {
-				setStatus( 'error', sprintf( __( 'Failed to hide: %s', 'mpfr' ), ( err && err.message ) || 'unknown' ) );
+				setStatus( 'error', sprintf( __( 'Failed to update visibility: %s', 'mpfr' ), ( err && err.message ) || 'unknown' ) );
 			} )
 			.finally( function () {
 				setBusy( btn, false );
@@ -574,8 +590,6 @@
 					} )
 					.catch( function () {} );
 			} );
-			// Also load hidden campaigns state
-			return loadHiddenCampaigns();
 		} )
 		.catch( function () {} );
 } )( window.wp, document );
