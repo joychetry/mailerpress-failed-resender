@@ -1770,6 +1770,100 @@ function mpfr_register_rest_routes() {
 			},
 		)
 	);
+
+	register_rest_route(
+		'mpfr/v1',
+		'/user/hidden-campaigns',
+		array(
+			'methods'             => 'GET',
+			'permission_callback' => function () {
+				return current_user_can( MPFR_CAPABILITY );
+			},
+			'callback'            => function ( \WP_REST_Request $request ) {
+				$user_id           = get_current_user_id();
+				$hidden_campaigns  = get_user_meta( $user_id, 'mpfr_hidden_campaigns', true );
+				if ( ! is_array( $hidden_campaigns ) ) {
+					$hidden_campaigns = array();
+				}
+				return rest_ensure_response(
+					array(
+						'hidden_campaigns' => array_values( array_map( 'intval', $hidden_campaigns ) ),
+						'count'            => count( $hidden_campaigns ),
+					)
+				);
+			},
+		)
+	);
+
+	register_rest_route(
+		'mpfr/v1',
+		'/user/hidden-campaigns',
+		array(
+			'methods'             => 'POST',
+			'permission_callback' => function () {
+				return current_user_can( MPFR_CAPABILITY );
+			},
+			'args'                => array(
+				'action'       => array(
+					'required'          => true,
+					'sanitize_callback' => 'sanitize_text_field',
+					'validate_callback' => function ( $param ) {
+						return in_array( $param, array( 'add', 'remove', 'toggle' ), true );
+					},
+				),
+				'campaign_id'  => array(
+					'required'          => true,
+					'sanitize_callback' => 'absint',
+				),
+			),
+			'callback'            => function ( \WP_REST_Request $request ) {
+				$user_id      = get_current_user_id();
+				$action       = $request->get_param( 'action' );
+				$campaign_id  = (int) $request->get_param( 'campaign_id' );
+				
+				$hidden_campaigns = get_user_meta( $user_id, 'mpfr_hidden_campaigns', true );
+				if ( ! is_array( $hidden_campaigns ) ) {
+					$hidden_campaigns = array();
+				}
+				
+				$index = array_search( $campaign_id, $hidden_campaigns, true );
+				
+				switch ( $action ) {
+					case 'add':
+						if ( $index === false ) {
+							$hidden_campaigns[] = $campaign_id;
+						}
+						break;
+						
+					case 'remove':
+						if ( $index !== false ) {
+							unset( $hidden_campaigns[ $index ] );
+							$hidden_campaigns = array_values( $hidden_campaigns );
+						}
+						break;
+						
+					case 'toggle':
+						if ( $index !== false ) {
+							unset( $hidden_campaigns[ $index ] );
+							$hidden_campaigns = array_values( $hidden_campaigns );
+						} else {
+							$hidden_campaigns[] = $campaign_id;
+						}
+						break;
+				}
+				
+				update_user_meta( $user_id, 'mpfr_hidden_campaigns', $hidden_campaigns );
+				
+				return rest_ensure_response(
+					array(
+						'success'          => true,
+						'hidden_campaigns' => array_values( array_map( 'intval', $hidden_campaigns ) ),
+						'count'            => count( $hidden_campaigns ),
+					)
+				);
+			},
+		)
+	);
 }
 
 /**
