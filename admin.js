@@ -561,12 +561,12 @@
 	function setBusy( btn, busy, busyLabel ) {
 		if ( busy ) {
 			btn.dataset.busy = '1';
-			btn.dataset.label = btn.textContent;
+			btn.dataset.label = btn.innerHTML;
 			btn.disabled = true;
 			btn.textContent = busyLabel || __( 'Working…', 'mpfr' );
 		} else {
 			btn.disabled = false;
-			btn.textContent = btn.dataset.label || btn.textContent;
+			btn.innerHTML = btn.dataset.label || btn.innerHTML;
 			delete btn.dataset.busy;
 		}
 	}
