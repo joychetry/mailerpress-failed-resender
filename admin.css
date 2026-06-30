@@ -42,12 +42,14 @@
 
 .mpfr-wrap .mpfr-col-num {
 	text-align: right;
-	width: 80px;
+	width: 70px;
 	font-variant-numeric: tabular-nums;
+	padding-right: 12px;
 }
 
 .mpfr-wrap .mpfr-col-status {
-	width: 110px;
+	width: 100px;
+	padding: 0 8px;
 }
 
 .mpfr-wrap .mpfr-col-campaign strong {
@@ -67,8 +69,18 @@
 }
 
 .mpfr-wrap .mpfr-col-actions {
-	width: 260px;
+	width: 200px;
 	white-space: nowrap;
+	padding-left: 12px;
+}
+
+.mpfr-wrap .mpfr-col-campaign {
+	padding-left: 12px;
+	padding-right: 8px;
+}
+
+.mpfr-wrap .mpfr-table td {
+	padding: 8px 10px;
 }
 
 .mpfr-wrap .mpfr-btn {
