@@ -67,6 +67,9 @@ function mpfr_bootstrap() {
 	add_action( 'admin_notices', 'mpfr_maybe_render_failed_campaigns_notice' );
 	add_action( 'admin_print_footer_scripts', 'mpfr_inject_row_action_script' );
 
+	// Register the background-batch AS callback.
+	add_action( mpfr_as_hook(), 'mpfr_process_resend_batch', 10, 3 );
+
 	if ( defined( 'WP_CLI' ) && WP_CLI ) {
 		\WP_CLI::add_command( 'mpfr retry-failed', '\\MailerPressFailedResender\\CLI\\Retry_Failed_Command' );
 	}
@@ -754,13 +757,104 @@ function mpfr_render_body( $html, $variables, $click_tracking = 'yes' ) {
 }
 
 /**
+ * --------------------------------------------------------------------------
+ * Progress tracking (for background / live-progress flow)
+ *
+ * Progress is stored in a transient `mpfr_progress_{$campaign_id}` so the
+ * REST endpoint can poll it cheaply. Each AS batch updates the transient
+ * in place. A separate `cancelled` flag is also stored under the same key.
+ * --------------------------------------------------------------------------
+ */
+
+function mpfr_progress_key( $campaign_id ) {
+	return 'mpfr_progress_' . (int) $campaign_id;
+}
+
+function mpfr_get_progress( $campaign_id ) {
+	$raw = get_transient( mpfr_progress_key( $campaign_id ) );
+	if ( ! is_array( $raw ) ) {
+		return null;
+	}
+	return wp_parse_args(
+		$raw,
+		array(
+			'campaign_id'   => (int) $campaign_id,
+			'status'        => 'idle',
+			'total'         => 0,
+			'sent'          => 0,
+			'skipped'       => 0,
+			'failed'        => 0,
+			'remaining'     => 0,
+			'next_offset'   => 0,
+			'batch_size'    => 50,
+			'batches_done'  => 0,
+			'started_at'    => '',
+			'updated_at'    => '',
+			'eta_seconds'   => 0,
+			'error_message' => '',
+		)
+	);
+}
+
+function mpfr_update_progress( $campaign_id, array $updates ) {
+	$current = mpfr_get_progress( $campaign_id );
+	if ( ! is_array( $current ) ) {
+		$current = array(
+			'campaign_id' => (int) $campaign_id,
+			'status'      => 'idle',
+		);
+	}
+	$merged                 = array_merge( $current, $updates );
+	$merged['updated_at']   = current_time( 'mysql' );
+	$merged['campaign_id']  = (int) $campaign_id;
+
+	// Recompute ETA: avg ms per email * remaining.
+	$processed = (int) $merged['sent'] + (int) $merged['skipped'] + (int) $merged['failed'];
+	if ( $merged['started_at'] && $processed > 0 ) {
+		$start_ts  = strtotime( (string) $merged['started_at'] . ' UTC' );
+		$now_ts    = time();
+		$elapsed   = max( 1, $now_ts - $start_ts );
+		$avg       = $elapsed / $processed;
+		$remaining = (int) $merged['remaining'];
+		$merged['eta_seconds'] = (int) round( $avg * $remaining );
+	}
+
+	set_transient( mpfr_progress_key( $campaign_id ), $merged, HOUR_IN_SECONDS );
+	return $merged;
+}
+
+function mpfr_clear_progress( $campaign_id ) {
+	delete_transient( mpfr_progress_key( $campaign_id ) );
+}
+
+/**
+ * Compute the total initial count of failed logs for a campaign (used as
+ * the denominator in the progress bar).
+ */
+function mpfr_total_failed_for_campaign( $campaign_id ) {
+	global $wpdb;
+	$logs = $wpdb->prefix . 'mailerpress_email_logs';
+	return (int) $wpdb->get_var(
+		$wpdb->prepare(
+			"SELECT COUNT(*) FROM {$logs} WHERE campaign_id = %d AND status = 'error'",
+			(int) $campaign_id
+		)
+	);
+}
+
+/**
  * Resend every failed email for a campaign using the active ESP.
+ *
+ * Backwards-compatible synchronous entry point. For long-running resends
+ * use mpfr_enqueue_resend_campaign() instead so the work runs in the
+ * background with progress tracking.
  *
  * @param int $campaign_id
  * @param int $limit  Max recipients to resend in this run (default 100, can be raised).
+ * @param int $offset Offset into the deduped failed-contact list.
  * @return array{resent:int,failed:int,skipped:int,remaining:int,total:int}
  */
-function mpfr_resend_failed_emails( $campaign_id, $limit = 100 ) {
+function mpfr_resend_failed_emails( $campaign_id, $limit = 100, $offset = 0 ) {
 	global $wpdb;
 
 	$campaign_id = (int) $campaign_id;
@@ -817,6 +911,33 @@ function mpfr_resend_failed_emails( $campaign_id, $limit = 100 ) {
 	$esp_key  = $services['default_service'] ?? 'php';
 	$api_key  = $services['services'][ $esp_key ]['conf']['api_key']
 		?? ( $services['services'][ $esp_key ]['conf']['apiKey'] ?? '' );
+
+	// Rate limit (emails per second) — read the same option + structure
+	// as MailerPress\Core\Jobs\SendEmailJob so the resend honours the
+	// configured frequency and doesn't get the account throttled.
+	$rate_limit = 10; // safe default
+	$frequency_sending = get_option(
+		'mailerpress_frequency_sending',
+		array(
+			'settings' => array(
+				'numberEmail' => 25,
+				'config'      => array( 'value' => 5, 'unit' => 'minutes' ),
+				'rate_limit'  => 10,
+			),
+		)
+	);
+	if ( is_string( $frequency_sending ) ) {
+		$frequency_sending = json_decode( $frequency_sending, true ) ?: array();
+	}
+	if ( isset( $frequency_sending['effectiveConfig']['rate_limit'] ) ) {
+		$rate_limit = (int) $frequency_sending['effectiveConfig']['rate_limit'];
+	} elseif ( isset( $frequency_sending['settings']['rate_limit'] ) ) {
+		$rate_limit = (int) $frequency_sending['settings']['rate_limit'];
+	}
+	$rate_limit          = max( 0, $rate_limit );
+	$delay_between_us    = $rate_limit > 0 ? (int) floor( 1_000_000 / $rate_limit ) : 0;
+	$send_index_in_batch = 0;
+	$total_in_batch      = 0;
 
 	// Get HTML body.
 	$html = mpfr_get_campaign_html( $campaign_id );
@@ -895,6 +1016,16 @@ function mpfr_resend_failed_emails( $campaign_id, $limit = 100 ) {
 		)
 	);
 
+	// Apply offset + limit to the deduped list (preserves keys for batching).
+	if ( $offset > 0 || $limit > 0 ) {
+		$unique_by_contact = array_slice(
+			$unique_by_contact,
+			max( 0, (int) $offset ),
+			$limit > 0 ? (int) $limit : null,
+			true
+		);
+	}
+
 	foreach ( $unique_by_contact as $key => $failed_row ) {
 		if ( $processed >= (int) $limit ) {
 			break;
@@ -929,80 +1060,96 @@ function mpfr_resend_failed_emails( $campaign_id, $limit = 100 ) {
 
 		// Skip unsubscribed / bounced / complained contacts.
 		$blocked_statuses = array( 'unsubscribed', 'bounced', 'complained' );
-		if ( isset( $contact->subscription_status ) && in_array( $contact->subscription_status, $blocked_statuses, true ) ) {
+		$is_blocked       = isset( $contact->subscription_status ) && in_array( $contact->subscription_status, $blocked_statuses, true );
+		if ( $is_blocked ) {
 			$skipped++;
-			// Mark the log row as resolved (it was a bounced/unsubscribed contact).
-			$wpdb->update(
-				$logs_table,
-				array( 'error_message' => 'skipped: ' . $contact->subscription_status ),
-				array( 'id' => (int) $failed_row['log_id'] ),
-				array( '%s' ),
-				array( '%d' )
-			);
-			continue;
-		}
-
-		// Build merge variables + render body.
-		$variables = mpfr_build_contact_variables( $contact, $campaign_id, $batch_id, $click_tracking );
-		$body      = mpfr_render_body( $html, $variables, $click_tracking );
-
-		// Send.
-		$result = false;
-		try {
-			$result = $mailer->sendEmail(
-				array(
-					'to'               => $to_email,
-					'html'             => true,
-					'body'             => $body,
-					'subject'          => $subject,
-					'sender_name'      => $sender_nm,
-					'sender_to'        => $sender_to,
-					'reply_to_name'    => $reply_to_name,
-					'reply_to_address' => $reply_to_address,
-					'apiKey'           => $api_key,
-					'campaign_id'      => $campaign_id,
-					'contact_id'       => $contact_id,
-					'batch_id'         => $batch_id,
+			// Mark ALL error logs for this contact as 'skipped' so the
+			// `WHERE status='error'` count naturally decreases and the
+			// background loop terminates.
+			$wpdb->query(
+				$wpdb->prepare(
+					"UPDATE {$logs_table}
+					 SET status = 'skipped',
+					     error_message = CONCAT('skipped: ', %s)
+					 WHERE campaign_id = %d
+					   AND status = 'error'
+					   AND ( contact_id = %d OR ( contact_id = 0 AND to_email = %s ) )",
+					$contact->subscription_status,
+					$campaign_id,
+					$contact_id,
+					$to_email
 				)
 			);
-		} catch ( \Throwable $e ) {
-			$result = new \WP_Error( 'mpfr_send_exception', $e->getMessage() );
+		} else {
+			// Build merge variables + render body.
+			$variables = mpfr_build_contact_variables( $contact, $campaign_id, $batch_id, $click_tracking );
+			$body      = mpfr_render_body( $html, $variables, $click_tracking );
+
+			// Send.
+			$result = false;
+			try {
+				$result = $mailer->sendEmail(
+					array(
+						'to'               => $to_email,
+						'html'             => true,
+						'body'             => $body,
+						'subject'          => $subject,
+						'sender_name'      => $sender_nm,
+						'sender_to'        => $sender_to,
+						'reply_to_name'    => $reply_to_name,
+						'reply_to_address' => $reply_to_address,
+						'apiKey'           => $api_key,
+						'campaign_id'      => $campaign_id,
+						'contact_id'       => $contact_id,
+						'batch_id'         => $batch_id,
+					)
+				);
+			} catch ( \Throwable $e ) {
+				$result = new \WP_Error( 'mpfr_send_exception', $e->getMessage() );
+			}
+
+			$is_error = ( $result instanceof \WP_Error ) || ( $result === false );
+
+			if ( $is_error ) {
+				$failed++;
+				$err_msg = $result instanceof \WP_Error ? $result->get_error_message() : 'sendEmail returned false';
+				$wpdb->update(
+					$logs_table,
+					array( 'error_message' => 'resend failed: ' . $err_msg ),
+					array( 'id' => (int) $failed_row['log_id'] ),
+					array( '%s' ),
+					array( '%d' )
+				);
+			} else {
+				// Success: mark all error logs for this contact as resolved.
+				$resent++;
+				$log_ids_resent[] = (int) $failed_row['log_id'];
+				$wpdb->query(
+					$wpdb->prepare(
+						"UPDATE {$logs_table}
+						 SET status = 'success',
+						     error_message = CONCAT('resent via MPFR on ', %s),
+						     sent_at = %s
+						 WHERE campaign_id = %d
+						   AND status = 'error'
+						   AND ( contact_id = %d OR ( contact_id = 0 AND to_email = %s ) )",
+						current_time( 'mysql' ),
+						current_time( 'mysql' ),
+						$campaign_id,
+						$contact_id,
+						$to_email
+					)
+				);
+			}
 		}
 
-		$is_error = ( $result instanceof \WP_Error ) || ( $result === false );
-
-		if ( $is_error ) {
-			$failed++;
-			$err_msg = $result instanceof \WP_Error ? $result->get_error_message() : 'sendEmail returned false';
-			$wpdb->update(
-				$logs_table,
-				array( 'error_message' => 'resend failed: ' . $err_msg ),
-				array( 'id' => (int) $failed_row['log_id'] ),
-				array( '%s' ),
-				array( '%d' )
-			);
-			continue;
+		// Rate-limit delay between sends (skip after the very last contact
+		// in the batch). Mirrors MailerPress\Jobs\SendEmailJob so we
+		// don't trip ESP throttling.
+		++$send_index_in_batch;
+		if ( $delay_between_us > 0 && $send_index_in_batch < count( $unique_by_contact ) ) {
+			usleep( $delay_between_us );
 		}
-
-		// Success: mark all error logs for this contact as resolved.
-		$resent++;
-		$log_ids_resent[] = (int) $failed_row['log_id'];
-		$wpdb->query(
-			$wpdb->prepare(
-				"UPDATE {$logs_table}
-				 SET status = 'success',
-				     error_message = CONCAT('resent via MPFR on ', %s),
-				     sent_at = %s
-				 WHERE campaign_id = %d
-				   AND status = 'error'
-				   AND ( contact_id = %d OR ( contact_id = 0 AND to_email = %s ) )",
-				current_time( 'mysql' ),
-				current_time( 'mysql' ),
-				$campaign_id,
-				$contact_id,
-				$to_email
-			)
-		);
 	}
 
 	// Decrement the batch's error_emails counter by the success count, increase sent_emails.
@@ -1035,6 +1182,297 @@ function mpfr_resend_failed_emails( $campaign_id, $limit = 100 ) {
 		'skipped'   => $skipped,
 		'remaining' => $remaining,
 		'total'     => $total_logs,
+	);
+}
+
+/**
+ * --------------------------------------------------------------------------
+ * Background (live-progress) flow
+ *
+ * The user wants live progress while a resend runs. The synchronous
+ * `mpfr_resend_failed_emails()` is fine for tiny queues but for a 200+
+ * failure campaign it can hit PHP max_execution_time and the browser
+ * sits there with a spinner.
+ *
+ * Instead we enqueue one Action Scheduler action per batch. Each batch
+ * resends up to `batch_size` (default 50) contacts, updates the
+ * progress transient, and re-enqueues itself if more remain. The JS
+ * polls GET /resend-progress every 600ms to render a live progress
+ * bar with counters + ETA + Cancel.
+ *
+ * Schedule: a single AS group "mpfr" is used so the user can see and
+ * cancel all in-progress resends via Tools → Scheduled Actions.
+ * --------------------------------------------------------------------------
+ */
+
+function mpfr_as_group() {
+	return 'mpfr';
+}
+
+function mpfr_as_hook() {
+	return 'mpfr_resend_batch';
+}
+
+/**
+ * Enqueue the first batch of a resend for a campaign.
+ *
+ * Idempotent: if a run is already in progress, returns false so the
+ * caller can surface "already running" to the user.
+ *
+ * @param int $campaign_id
+ * @param int $batch_size
+ * @return array{ok:bool, reason?:string, progress?:array}
+ */
+function mpfr_enqueue_resend_campaign( $campaign_id, $batch_size = 50 ) {
+	$campaign_id  = (int) $campaign_id;
+	$batch_size   = max( 1, min( 200, (int) $batch_size ) );
+
+	if ( ! function_exists( 'as_enqueue_async_action' ) ) {
+		return array(
+			'ok'     => false,
+			'reason' => __( 'Action Scheduler is not available.', 'mpfr' ),
+		);
+	}
+
+	$current = mpfr_get_progress( $campaign_id );
+	if ( is_array( $current ) && isset( $current['status'] ) && in_array( $current['status'], array( 'running', 'starting' ), true ) ) {
+		return array(
+			'ok'     => false,
+			'reason' => __( 'A resend is already running for this campaign. Cancel it first.', 'mpfr' ),
+		);
+	}
+
+	$total = mpfr_total_failed_for_campaign( $campaign_id );
+	if ( $total <= 0 ) {
+		// Nothing to do — record a quick "done" so the UI gets a final state.
+		mpfr_update_progress(
+			$campaign_id,
+			array(
+				'status'        => 'done',
+				'total'         => 0,
+				'sent'          => 0,
+				'failed'        => 0,
+				'skipped'       => 0,
+				'remaining'     => 0,
+				'next_offset'   => 0,
+				'batch_size'    => $batch_size,
+				'batches_done'  => 0,
+				'started_at'    => current_time( 'mysql' ),
+				'eta_seconds'   => 0,
+				'error_message' => '',
+			)
+		);
+		return array(
+			'ok'        => true,
+			'progress'  => mpfr_get_progress( $campaign_id ),
+		);
+	}
+
+	mpfr_update_progress(
+		$campaign_id,
+		array(
+			'status'        => 'starting',
+			'total'         => $total,
+			'sent'          => 0,
+			'failed'        => 0,
+			'skipped'       => 0,
+			'remaining'     => $total,
+			'next_offset'   => 0,
+			'batch_size'    => $batch_size,
+			'batches_done'  => 0,
+			'started_at'    => current_time( 'mysql' ),
+			'eta_seconds'   => 0,
+			'error_message' => '',
+		)
+	);
+
+	as_enqueue_async_action(
+		mpfr_as_hook(),
+		array(
+			'campaign_id' => $campaign_id,
+			'offset'      => 0,
+			'limit'       => $batch_size,
+		),
+		mpfr_as_group()
+	);
+
+	// Kick the AS queue + WP-Cron so the queued action starts
+	// processing within ~1s rather than waiting for the next
+	// natural page load. spawn_cron() is non-blocking (uses
+	// non-blocking HTTP request to wp-cron.php).
+	if ( function_exists( 'spawn_cron' ) ) {
+		spawn_cron();
+	}
+	if ( function_exists( 'ActionScheduler' ) && class_exists( '\\ActionScheduler_QueueRunner' ) ) {
+		// Try the modern API: ActionScheduler::runner() then run().
+		try {
+			$runner = \ActionScheduler_QueueRunner::instance();
+			if ( $runner ) {
+				$runner->run();
+			}
+		} catch ( \Throwable $e ) {
+			// ignore — the next cron run will pick it up
+		}
+	}
+
+	return array(
+		'ok'       => true,
+		'progress' => mpfr_get_progress( $campaign_id ),
+	);
+}
+
+/**
+ * Action Scheduler callback: resend one batch and re-enqueue if more remain.
+ *
+ * We deliberately ignore the `$offset` argument and re-query the
+ * remaining failed list at the start of each batch — as we mark
+ * contacts success/skipped, they drop out of the
+ * `status='error'` query, so the next batch naturally picks up where
+ * this one left off. This is simpler and avoids any offset drift.
+ *
+ * Args (positional): [campaign_id, offset, limit]. Offset kept for
+ * backwards-compat with already-scheduled actions.
+ *
+ * @param int $campaign_id
+ * @param int $offset       Unused; kept for signature compatibility.
+ * @param int $limit
+ */
+function mpfr_process_resend_batch( $campaign_id, $offset, $limit ) {
+	$campaign_id = (int) $campaign_id;
+	$offset      = max( 0, (int) $offset );
+	$limit       = max( 1, min( 200, (int) $limit ) );
+
+	// Cancellation check (set by /resend-cancel).
+	$current = mpfr_get_progress( $campaign_id );
+	if ( is_array( $current ) && isset( $current['status'] ) && $current['status'] === 'cancelled' ) {
+		return;
+	}
+
+	// Mark as running.
+	mpfr_update_progress( $campaign_id, array( 'status' => 'running' ) );
+
+	try {
+		$result = mpfr_resend_failed_emails( $campaign_id, $limit, 0 );
+	} catch ( \Throwable $e ) {
+		mpfr_update_progress(
+			$campaign_id,
+			array(
+				'status'        => 'error',
+				'error_message' => $e->getMessage(),
+			)
+		);
+		return;
+	}
+
+	if ( ! empty( $result['error'] ) ) {
+		$sentinel = is_array( $current ) ? (int) ( $current['sent'] ?? 0 ) : 0;
+		// If we never managed to send one (e.g. no active service) and
+		// the batch made no progress, mark the whole run as errored.
+		if ( $sentinel === 0 && (int) ( $result['resent'] ?? 0 ) === 0 ) {
+			mpfr_update_progress(
+				$campaign_id,
+				array(
+					'status'        => 'error',
+					'error_message' => $result['error'],
+				)
+			);
+			return;
+		}
+		// Mid-run error: continue with whatever was already done.
+	}
+
+	$resent    = (int) ( $result['resent']  ?? 0 );
+	$failed    = (int) ( $result['failed']  ?? 0 );
+	$skipped   = (int) ( $result['skipped'] ?? 0 );
+	$remaining = (int) ( $result['remaining'] ?? 0 );
+
+	$updates = array(
+		'sent'         => ( is_array( $current ) ? (int) ( $current['sent'] ?? 0 ) : 0 ) + $resent,
+		'failed'       => ( is_array( $current ) ? (int) ( $current['failed']  ?? 0 ) : 0 ) + $failed,
+		'skipped'      => ( is_array( $current ) ? (int) ( $current['skipped'] ?? 0 ) : 0 ) + $skipped,
+		'remaining'    => $remaining,
+		'batches_done' => ( is_array( $current ) ? (int) ( $current['batches_done'] ?? 0 ) : 0 ) + 1,
+	);
+
+	// Done? Mark and stop.
+	if ( $remaining <= 0 ) {
+		$updates['status']      = 'done';
+		$updates['eta_seconds'] = 0;
+		mpfr_update_progress( $campaign_id, $updates );
+		return;
+	}
+
+	// No progress was made this batch (e.g. transient failure with the
+	// ESP). Stop here so we don't burn CPU in a tight loop. The user
+	// can click Retry again to resume.
+	if ( ( $resent + $failed + $skipped ) === 0 ) {
+		$updates['status']        = 'error';
+		$updates['error_message'] = __( 'No progress in last batch; stopping. Click Retry again to resume.', 'mpfr' );
+		mpfr_update_progress( $campaign_id, $updates );
+		return;
+	}
+
+	// Re-enqueue next batch.
+	$updates['status'] = 'running';
+	mpfr_update_progress( $campaign_id, $updates );
+
+	if ( function_exists( 'as_enqueue_async_action' ) ) {
+		as_enqueue_async_action(
+			mpfr_as_hook(),
+			array(
+				'campaign_id' => $campaign_id,
+				'offset'      => 0,
+				'limit'       => $limit,
+			),
+			mpfr_as_group()
+		);
+	} else {
+		mpfr_update_progress(
+			$campaign_id,
+			array(
+				'status'        => 'error',
+				'error_message' => __( 'Action Scheduler disappeared mid-run.', 'mpfr' ),
+			)
+		);
+	}
+}
+
+/**
+ * Cancel an in-progress resend. Sets the cancelled flag and unschedules
+ * any pending batches. The currently-executing batch (if any) will
+ * finish naturally but the callback will see cancelled=true and not
+ * re-enqueue.
+ *
+ * @param int $campaign_id
+ * @return array{ok:bool, cancelled:bool}
+ */
+function mpfr_cancel_resend( $campaign_id ) {
+	$campaign_id = (int) $campaign_id;
+	$current     = mpfr_get_progress( $campaign_id );
+
+	if ( ! is_array( $current ) || ! in_array( $current['status'] ?? '', array( 'running', 'starting' ), true ) ) {
+		return array(
+			'ok'        => true,
+			'cancelled' => false,
+		);
+	}
+
+	mpfr_update_progress(
+		$campaign_id,
+		array(
+			'status'        => 'cancelled',
+			'eta_seconds'   => 0,
+		)
+	);
+
+	// Unschedule any pending batches in our group.
+	if ( function_exists( 'as_unschedule_all_actions' ) ) {
+		as_unschedule_all_actions( mpfr_as_hook(), null, mpfr_as_group() );
+	}
+
+	return array(
+		'ok'        => true,
+		'cancelled' => true,
 	);
 }
 
@@ -1186,37 +1624,146 @@ function mpfr_register_rest_routes() {
 					'required'          => true,
 					'sanitize_callback' => 'absint',
 				),
-				'limit'       => array(
-					'default'           => 100,
+				'batch_size'  => array(
+					'default'           => 50,
+					'sanitize_callback' => 'absint',
+				),
+				'sync'        => array(
+					'default' => false,
+				),
+			),
+			'callback'            => function ( \WP_REST_Request $request ) {
+				$cid        = (int) $request->get_param( 'campaign_id' );
+				$batch_size = max( 1, min( 200, (int) $request->get_param( 'batch_size' ) ) );
+				$sync       = (bool) $request->get_param( 'sync' );
+
+				// Legacy synchronous mode (used by WP-CLI / debugging).
+				if ( $sync ) {
+					$limit  = max( 1, min( 500, (int) $request->get_param( 'limit' ) ) );
+					$result = mpfr_resend_failed_emails( $cid, $limit );
+
+					if ( ! empty( $result['error'] ) ) {
+						return new \WP_Error( 'mpfr_resend_error', $result['error'], array( 'status' => 400 ) );
+					}
+
+					$message = sprintf(
+						/* translators: 1: resent, 2: failed, 3: remaining */
+						__( 'Resent: %1$d · Still failing: %2$d · Remaining in queue: %3$d', 'mpfr' ),
+						(int) $result['resent'],
+						(int) $result['failed'],
+						(int) $result['remaining']
+					);
+
+					return rest_ensure_response(
+						array(
+							'success'   => true,
+							'message'   => $message,
+							'resent'    => (int) $result['resent'],
+							'failed'    => (int) $result['failed'],
+							'skipped'   => (int) $result['skipped'],
+							'remaining' => (int) $result['remaining'],
+							'total'     => (int) $result['total'],
+						)
+					);
+				}
+
+				// Default: enqueue background batches for live progress.
+				$enqueue = mpfr_enqueue_resend_campaign( $cid, $batch_size );
+				if ( empty( $enqueue['ok'] ) ) {
+					return new \WP_Error(
+						'mpfr_enqueue_failed',
+						$enqueue['reason'] ?? __( 'Could not start the resend.', 'mpfr' ),
+						array( 'status' => 400 )
+					);
+				}
+
+				return rest_ensure_response(
+					array(
+						'success'     => true,
+						'scheduled'   => true,
+						'campaign_id' => $cid,
+						'progress'    => $enqueue['progress'],
+					)
+				);
+			},
+		)
+	);
+
+	register_rest_route(
+		'mpfr/v1',
+		'/campaign/(?P<campaign_id>\d+)/resend-progress',
+		array(
+			'methods'             => 'GET',
+			'permission_callback' => function () {
+				return current_user_can( MPFR_CAPABILITY );
+			},
+			'args'                => array(
+				'campaign_id' => array(
+					'required'          => true,
+					'sanitize_callback' => 'absint',
+				),
+			),
+			'callback'            => function ( \WP_REST_Request $request ) {
+				$cid      = (int) $request->get_param( 'campaign_id' );
+				$progress = mpfr_get_progress( $cid );
+				$failed   = mpfr_total_failed_for_campaign( $cid );
+
+				if ( ! is_array( $progress ) ) {
+					// No run ever started — return a default idle state with the
+					// current failed count so the UI can show a "0/N done" bar.
+					return rest_ensure_response(
+						array(
+							'campaign_id'   => $cid,
+							'status'        => 'idle',
+							'total'         => $failed,
+							'sent'          => 0,
+							'failed'        => 0,
+							'skipped'       => 0,
+							'remaining'     => $failed,
+							'next_offset'   => 0,
+							'batch_size'    => 50,
+							'batches_done'  => 0,
+							'started_at'    => '',
+							'updated_at'    => '',
+							'eta_seconds'   => 0,
+							'error_message' => '',
+						)
+					);
+				}
+
+				// Always reflect live remaining from the table.
+				$progress['remaining'] = $failed;
+				if ( $progress['status'] === 'done' ) {
+					$progress['remaining'] = 0;
+				}
+
+				return rest_ensure_response( $progress );
+			},
+		)
+	);
+
+	register_rest_route(
+		'mpfr/v1',
+		'/campaign/(?P<campaign_id>\d+)/resend-cancel',
+		array(
+			'methods'             => 'POST',
+			'permission_callback' => function () {
+				return current_user_can( MPFR_CAPABILITY );
+			},
+			'args'                => array(
+				'campaign_id' => array(
+					'required'          => true,
 					'sanitize_callback' => 'absint',
 				),
 			),
 			'callback'            => function ( \WP_REST_Request $request ) {
 				$cid    = (int) $request->get_param( 'campaign_id' );
-				$limit  = max( 1, min( 500, (int) $request->get_param( 'limit' ) ) );
-				$result = mpfr_resend_failed_emails( $cid, $limit );
-
-				if ( ! empty( $result['error'] ) ) {
-					return new \WP_Error( 'mpfr_resend_error', $result['error'], array( 'status' => 400 ) );
-				}
-
-				$message = sprintf(
-					/* translators: 1: resent, 2: failed, 3: remaining */
-					__( 'Resent: %1$d · Still failing: %2$d · Remaining in queue: %3$d', 'mpfr' ),
-					(int) $result['resent'],
-					(int) $result['failed'],
-					(int) $result['remaining']
-				);
-
+				$result = mpfr_cancel_resend( $cid );
 				return rest_ensure_response(
 					array(
 						'success'   => true,
-						'message'   => $message,
-						'resent'    => (int) $result['resent'],
-						'failed'    => (int) $result['failed'],
-						'skipped'   => (int) $result['skipped'],
-						'remaining' => (int) $result['remaining'],
-						'total'     => (int) $result['total'],
+						'cancelled' => (bool) ( $result['cancelled'] ?? false ),
+						'progress'  => mpfr_get_progress( $cid ),
 					)
 				);
 			},
@@ -1454,16 +2001,17 @@ function mpfr_inject_row_action_script() {
 	}
 
 	/**
-	 * Trigger the resend endpoint (per-recipient, by campaign_id) and report
-	 * the result via MailerPress's #toast-root or a fallback alert.
+	 * Trigger the resend endpoint (per-recipient, by campaign_id) and
+	 * start a polling loop for live progress.
 	 */
 	function runResend( campaignId, btn ) {
 		var orig = btn.textContent;
 		btn.disabled = true;
-		btn.textContent = 'Resending…';
+		btn.textContent = 'Starting…';
 		fetch( REST_BASE + 'campaign/' + campaignId + '/resend-failed', {
 			method: 'POST',
-			headers: { 'X-WP-Nonce': NONCE }
+			headers: { 'X-WP-Nonce': NONCE, 'Content-Type': 'application/json' },
+			body: JSON.stringify( { batch_size: 50 } )
 		} )
 			.then( function ( r ) {
 				if ( ! r.ok ) {
@@ -1474,11 +2022,14 @@ function mpfr_inject_row_action_script() {
 				return r.json();
 			} )
 			.then( function ( j ) {
-				// Defer notify slightly so it survives any synchronous DOM cleanup.
-				setTimeout( function () {
-					notify( j.message || ( 'Resent: ' + ( j.resent || 0 ) + '.' ), 'success' );
-				}, 50 );
 				delete batchCache[ campaignId ];
+				if ( j && j.scheduled ) {
+					pollProgress( campaignId, '' );
+				} else {
+					setTimeout( function () {
+						notify( ( j && j.message ) || ( 'Resent: ' + ( j.resent || 0 ) + '.' ), 'success' );
+					}, 50 );
+				}
 			} )
 			.catch( function ( err ) {
 				setTimeout( function () {
@@ -1492,11 +2043,160 @@ function mpfr_inject_row_action_script() {
 	}
 
 	/**
-	 * Show a transient banner inside the page. We attach to document.body
-	 * (fixed position top-right) so React re-renders don't remove it.
-	 *
-	 * React/MailerPress may try to clean up body children, so we
-	 * periodically re-append the node if it gets detached.
+	 * Polling loop for the kebab-injected flow. Mirrors admin.js behaviour.
+	 */
+	var pollers = Object.create( null );
+	function pollProgress( campaignId, title ) {
+		if ( pollers[ campaignId ] ) return; // already polling
+		var stop = false;
+		var pinged = 0;
+		var tick = function () {
+			if ( stop ) return;
+			// Every 3rd tick, ping wp-cron to make sure Action Scheduler
+			// picks up the queued batch (REST requests don't trigger cron).
+			pinged++;
+			if ( pinged % 3 === 0 ) {
+				var cron = new Image();
+				cron.src = '/wp-cron.php?doing_wp_cron=' + Date.now();
+			}
+			fetch( REST_BASE + 'campaign/' + campaignId + '/resend-progress', {
+				headers: { 'X-WP-Nonce': NONCE }
+			} )
+				.then( function ( r ) { return r.json(); } )
+				.then( function ( p ) {
+					if ( stop ) return;
+					if ( ! p || p.status === 'idle' ) return;
+					ensureCard( campaignId, title );
+					updateCard( campaignId, p );
+					if ( p.status === 'done' || p.status === 'cancelled' || p.status === 'error' ) {
+						stop = true;
+						delete pollers[ campaignId ];
+						setTimeout( function () { removeCard( campaignId ); }, 6000 );
+						return;
+					}
+					setTimeout( tick, 600 );
+				} )
+				.catch( function () {
+					if ( stop ) return;
+					setTimeout( tick, 1500 );
+				} );
+		};
+		pollers[ campaignId ] = function () { stop = true; };
+		tick();
+	}
+
+	function cancelResend( campaignId ) {
+		fetch( REST_BASE + 'campaign/' + campaignId + '/resend-cancel', {
+			method: 'POST',
+			headers: { 'X-WP-Nonce': NONCE }
+		} );
+		// The polling loop will pick up the cancelled status.
+	}
+
+	/**
+	 * Show / update the floating progress card on document.body.
+	 */
+	function ensureCard( campaignId, title ) {
+		var id = 'mpfr-progress-card-' + campaignId;
+		var el = document.getElementById( id );
+		if ( el ) return el;
+		el = document.createElement( 'div' );
+		el.id = id;
+		el.className = 'mpfr-progress-card';
+		el.setAttribute( 'data-campaign', String( campaignId ) );
+		el.innerHTML = [
+			'<div class="mpfr-progress-head">',
+				'<span class="mpfr-progress-title"></span>',
+				'<button type="button" class="mpfr-progress-close" aria-label="Close">×</button>',
+			'</div>',
+			'<div class="mpfr-progress-bar"><div class="mpfr-progress-fill" style="width:0%"></div></div>',
+			'<div class="mpfr-progress-stats"></div>',
+			'<div class="mpfr-progress-eta"></div>',
+			'<div class="mpfr-progress-actions">',
+				'<button type="button" class="button mpfr-progress-cancel">Cancel</button>',
+			'</div>'
+		].join( '' );
+		el.querySelector( '.mpfr-progress-title' ).textContent = title
+			? ( 'Resending campaign #' + campaignId + ' — ' + title )
+			: ( 'Resending campaign #' + campaignId );
+		document.body.appendChild( el );
+		el.querySelector( '.mpfr-progress-close' ).addEventListener( 'click', function () {
+			el.remove();
+		} );
+		el.querySelector( '.mpfr-progress-cancel' ).addEventListener( 'click', function () {
+			cancelResend( campaignId );
+		} );
+		return el;
+	}
+
+	function progressPct( progress ) {
+		var total = parseInt( progress.total, 10 ) || 0;
+		if ( total <= 0 ) return 0;
+		var sent     = parseInt( progress.sent,     10 ) || 0;
+		var failed   = parseInt( progress.failed,   10 ) || 0;
+		var skipped  = parseInt( progress.skipped,  10 ) || 0;
+		return Math.min( 100, Math.round( ( ( sent + failed + skipped ) / total ) * 100 ) );
+	}
+
+	function formatEta( seconds ) {
+		seconds = parseInt( seconds, 10 ) || 0;
+		if ( seconds <= 0 ) return '—';
+		if ( seconds < 60 ) return seconds + 's';
+		var m = Math.floor( seconds / 60 );
+		var s = seconds % 60;
+		return m + 'm ' + s + 's';
+	}
+
+	function updateCard( campaignId, progress ) {
+		var el = document.getElementById( 'mpfr-progress-card-' + campaignId );
+		if ( ! el ) return;
+		var status = progress.status || 'running';
+		el.className = 'mpfr-progress-card mpfr-progress-card--' + status;
+
+		el.querySelector( '.mpfr-progress-fill' ).style.width = progressPct( progress ) + '%';
+
+		var total     = parseInt( progress.total,     10 ) || 0;
+		var sent      = parseInt( progress.sent,      10 ) || 0;
+		var failed    = parseInt( progress.failed,    10 ) || 0;
+		var skipped   = parseInt( progress.skipped,   10 ) || 0;
+		var remaining = parseInt( progress.remaining, 10 ) || 0;
+		var eta       = parseInt( progress.eta_seconds, 10 ) || 0;
+
+		el.querySelector( '.mpfr-progress-stats' ).innerHTML = [
+			'<span>Total: <strong>', total, '</strong></span>',
+			'<span style="color:#00a32a">Sent: <strong>', sent, '</strong></span>',
+			( failed > 0 ? '<span style="color:#d63638">Failed: <strong>' + failed + '</strong></span>' : '' ),
+			( skipped > 0 ? '<span style="color:#dba617">Skipped: <strong>' + skipped + '</strong></span>' : '' ),
+			'<span>Remaining: <strong>', remaining, '</strong></span>'
+		].join( '' );
+
+		var etaEl = el.querySelector( '.mpfr-progress-eta' );
+		if ( status === 'done' ) {
+			etaEl.textContent = 'Done — ' + sent + ' resent';
+			etaEl.style.color = '#00a32a';
+		} else if ( status === 'cancelled' ) {
+			etaEl.textContent = 'Cancelled — ' + sent + ' resent, ' + remaining + ' still queued';
+			etaEl.style.color = '#dba617';
+		} else if ( status === 'error' ) {
+			etaEl.textContent = 'Error: ' + ( progress.error_message || 'unknown' );
+			etaEl.style.color = '#d63638';
+		} else {
+			etaEl.textContent = 'ETA: ~' + formatEta( eta );
+			etaEl.style.color = '';
+		}
+
+		var cancelBtn = el.querySelector( '.mpfr-progress-cancel' );
+		var isTerminal = ( status === 'done' || status === 'cancelled' || status === 'error' );
+		cancelBtn.style.display = isTerminal ? 'none' : '';
+	}
+
+	function removeCard( campaignId ) {
+		var el = document.getElementById( 'mpfr-progress-card-' + campaignId );
+		if ( el ) el.remove();
+	}
+
+	/**
+	 * Backwards-compat toast for the legacy sync flow.
 	 */
 	function notify( message, type ) {
 		var el = document.createElement( 'div' );
@@ -1511,14 +2211,11 @@ function mpfr_inject_row_action_script() {
 			+ 'box-shadow:0 4px 12px rgba(0,0,0,0.15);max-width:480px;'
 			+ 'transition:opacity 0.3s;';
 		document.body.appendChild( el );
-
-		// Re-attach if detached by a React re-render.
 		var guard = setInterval( function () {
 			if ( ! el.isConnected ) {
 				document.body.appendChild( el );
 			}
 		}, 250 );
-
 		setTimeout( function () {
 			clearInterval( guard );
 			el.style.opacity = '0';

@@ -1,11 +1,12 @@
 /**
  * MailerPress Failed Resender — admin page controller.
  *
- * Loads failed campaigns from our own REST endpoint
- * ( /wp-json/mpfr/v1/failed-campaigns ) and wires the per-row
- * "Retry Failed Emails" and "Reset Chunks" buttons to:
- *   POST /wp-json/mpfr/v1/campaign/{id}/resend-failed  (resend every failed recipient)
- *   POST /wp-json/mpfr/v1/batch/{id}/reset             (zero counters, reset all chunks)
+ * - Loads failed campaigns from /mp-json/mpfr/v1/failed-campaigns.
+ * - "Retry Failed Emails" enqueues a background batch via Action Scheduler
+ *   (POST /mpfr/v1/campaign/{id}/resend-failed) and starts a polling loop
+ *   against GET /mpfr/v1/campaign/{id}/resend-progress.
+ * - A floating progress card shows a live bar + counters + ETA + Cancel.
+ * - "Reset Chunks" still calls POST /mpfr/v1/batch/{id}/reset (legacy flow).
  *
  * No external dependencies beyond wp-api-fetch (bundled with WordPress core).
  */
@@ -13,7 +14,6 @@
 	'use strict';
 
 	if ( ! wp || ! wp.apiFetch ) {
-		// Core not loaded yet — bail; user will see "Loading…" until ready.
 		return;
 	}
 
@@ -32,12 +32,9 @@
 
 	apiFetch.use( apiFetch.createNonceMiddleware( data.nonce ) );
 
-	/**
-	 * Render a status banner above the table.
-	 *
-	 * @param {string} type    'success' | 'error' | 'info'
-	 * @param {string} message
-	 */
+	// ------------------------------------------------------------------
+	// Status banner
+	// ------------------------------------------------------------------
 	function setStatus( type, message ) {
 		if ( ! elStatus ) {
 			return;
@@ -45,46 +42,16 @@
 		elStatus.className = 'mpfr-status mpfr-status--' + type;
 		elStatus.textContent = message;
 		elStatus.hidden = false;
-
-		// Auto-dismiss success/info after 5s.
 		if ( type === 'success' || type === 'info' ) {
-			setTimeout( function () {
-				elStatus.hidden = true;
-			}, 5000 );
+			setTimeout( function () { elStatus.hidden = true; }, 5000 );
 		}
 	}
 
-	/**
-	 * Format a date string for display.
-	 *
-	 * @param {string} iso
-	 * @returns {string}
-	 */
-	function formatDate( iso ) {
-		if ( ! iso ) {
-			return '—';
-		}
-		try {
-			var d = new Date( iso.replace( ' ', 'T' ) + 'Z' );
-			if ( isNaN( d.getTime() ) ) {
-				return iso;
-			}
-			return d.toLocaleString();
-		} catch ( e ) {
-			return iso;
-		}
-	}
-
-	/**
-	 * Escape HTML in untrusted text.
-	 *
-	 * @param {string} str
-	 * @returns {string}
-	 */
+	// ------------------------------------------------------------------
+	// Utilities
+	// ------------------------------------------------------------------
 	function esc( str ) {
-		if ( str === null || str === undefined ) {
-			return '';
-		}
+		if ( str === null || str === undefined ) return '';
 		return String( str )
 			.replace( /&/g, '&amp;' )
 			.replace( /</g, '&lt;' )
@@ -93,18 +60,267 @@
 			.replace( /'/g, '&#039;' );
 	}
 
-	/**
-	 * Build the table rows from the API response.
-	 *
-	 * @param {Array} rows
-	 */
+	function formatDate( iso ) {
+		if ( ! iso ) return '—';
+		try {
+			var d = new Date( iso.replace( ' ', 'T' ) + 'Z' );
+			if ( isNaN( d.getTime() ) ) return iso;
+			return d.toLocaleString();
+		} catch ( e ) { return iso; }
+	}
+
+	function formatEta( seconds ) {
+		seconds = parseInt( seconds, 10 ) || 0;
+		if ( seconds <= 0 ) return '—';
+		if ( seconds < 60 ) return seconds + 's';
+		var m = Math.floor( seconds / 60 );
+		var s = seconds % 60;
+		return m + 'm ' + s + 's';
+	}
+
+	function progressPct( progress ) {
+		var total = parseInt( progress.total, 10 ) || 0;
+		if ( total <= 0 ) return 0;
+		var sent     = parseInt( progress.sent,     10 ) || 0;
+		var failed   = parseInt( progress.failed,   10 ) || 0;
+		var skipped  = parseInt( progress.skipped,  10 ) || 0;
+		var done     = sent + failed + skipped;
+		return Math.min( 100, Math.round( ( done / total ) * 100 ) );
+	}
+
+	// ------------------------------------------------------------------
+	// Progress card (one per running resend, on document.body)
+	// ------------------------------------------------------------------
+	var cards = Object.create( null );
+
+	function ensureCard( campaignId, title ) {
+		var id = 'mpfr-progress-card-' + campaignId;
+		var el = document.getElementById( id );
+		if ( el ) return el;
+		el = document.createElement( 'div' );
+		el.id = id;
+		el.className = 'mpfr-progress-card';
+		el.setAttribute( 'data-campaign', String( campaignId ) );
+		el.innerHTML = [
+			'<div class="mpfr-progress-head">',
+				'<span class="mpfr-progress-title"></span>',
+				'<button type="button" class="mpfr-progress-close" aria-label="Close">×</button>',
+			'</div>',
+			'<div class="mpfr-progress-bar"><div class="mpfr-progress-fill" style="width:0%"></div></div>',
+			'<div class="mpfr-progress-stats"></div>',
+			'<div class="mpfr-progress-eta"></div>',
+			'<div class="mpfr-progress-actions">',
+				'<button type="button" class="button mpfr-progress-cancel">Cancel</button>',
+			'</div>'
+		].join( '' );
+		el.querySelector( '.mpfr-progress-title' ).textContent = title
+			? ( 'Resending campaign #' + campaignId + ' — ' + title )
+			: ( 'Resending campaign #' + campaignId );
+		document.body.appendChild( el );
+		el.querySelector( '.mpfr-progress-close' ).addEventListener( 'click', function () {
+			el.remove();
+		} );
+		el.querySelector( '.mpfr-progress-cancel' ).addEventListener( 'click', function () {
+			cancelResend( campaignId );
+		} );
+		return el;
+	}
+
+	function updateCard( campaignId, progress ) {
+		var el = document.getElementById( 'mpfr-progress-card-' + campaignId );
+		if ( ! el ) return;
+		var status = progress.status || 'running';
+		el.className = 'mpfr-progress-card mpfr-progress-card--' + status;
+
+		var pct = progressPct( progress );
+		el.querySelector( '.mpfr-progress-fill' ).style.width = pct + '%';
+
+		var total     = parseInt( progress.total,     10 ) || 0;
+		var sent      = parseInt( progress.sent,      10 ) || 0;
+		var failed    = parseInt( progress.failed,    10 ) || 0;
+		var skipped   = parseInt( progress.skipped,   10 ) || 0;
+		var remaining = parseInt( progress.remaining, 10 ) || 0;
+		var eta       = parseInt( progress.eta_seconds, 10 ) || 0;
+
+		el.querySelector( '.mpfr-progress-stats' ).innerHTML = [
+			'<span>Total: <strong>', total, '</strong></span>',
+			'<span style="color:#00a32a">Sent: <strong>', sent, '</strong></span>',
+			( failed > 0 ? '<span style="color:#d63638">Failed: <strong>' + failed + '</strong></span>' : '' ),
+			( skipped > 0 ? '<span style="color:#dba617">Skipped: <strong>' + skipped + '</strong></span>' : '' ),
+			'<span>Remaining: <strong>', remaining, '</strong></span>'
+		].join( '' );
+
+		var etaEl = el.querySelector( '.mpfr-progress-eta' );
+		if ( status === 'done' ) {
+			etaEl.textContent = 'Done — ' + sent + ' resent';
+			etaEl.style.color = '#00a32a';
+		} else if ( status === 'cancelled' ) {
+			etaEl.textContent = 'Cancelled — ' + sent + ' resent, ' + remaining + ' still queued';
+			etaEl.style.color = '#dba617';
+		} else if ( status === 'error' ) {
+			etaEl.textContent = 'Error: ' + ( progress.error_message || 'unknown' );
+			etaEl.style.color = '#d63638';
+		} else if ( remaining === 0 && total > 0 ) {
+			etaEl.textContent = 'Finalising…';
+		} else {
+			etaEl.textContent = 'ETA: ~' + formatEta( eta );
+			etaEl.style.color = '';
+		}
+
+		// Hide the cancel button on terminal states.
+		var cancelBtn = el.querySelector( '.mpfr-progress-cancel' );
+		var isTerminal = ( status === 'done' || status === 'cancelled' || status === 'error' );
+		cancelBtn.style.display = isTerminal ? 'none' : '';
+	}
+
+	function removeCard( campaignId ) {
+		var el = document.getElementById( 'mpfr-progress-card-' + campaignId );
+		if ( el ) el.remove();
+	}
+
+	// ------------------------------------------------------------------
+	// Polling
+	// ------------------------------------------------------------------
+	function pollProgress( campaignId, title ) {
+		var stop = false;
+		var pinged = 0;
+		var tick = function () {
+			if ( stop ) return;
+			// Every 3rd tick, ping wp-cron to make sure Action Scheduler
+			// picks up the queued batch (REST requests don't trigger cron).
+			pinged++;
+			if ( pinged % 3 === 0 ) {
+				var cron = new Image();
+				cron.src = ( window.MPFR_DATA && window.MPFR_DATA.cronUrl ) || ( '/wp-cron.php?doing_wp_cron=' + Date.now() );
+			}
+			apiFetch( { path: '/mpfr/v1/campaign/' + campaignId + '/resend-progress' } )
+				.then( function ( progress ) {
+					if ( stop ) return;
+					if ( ! progress || progress.status === 'idle' ) {
+						// No active run; nothing to show.
+						return;
+					}
+					ensureCard( campaignId, title );
+					updateCard( campaignId, progress );
+					if ( progress.status === 'done' || progress.status === 'cancelled' || progress.status === 'error' ) {
+						stop = true;
+						delete cards[ campaignId ];
+						loadRows();
+						setTimeout( function () { removeCard( campaignId ); }, 6000 );
+						return;
+					}
+					setTimeout( tick, 600 );
+				} )
+				.catch( function () {
+					if ( stop ) return;
+					setTimeout( tick, 1500 );
+				} );
+		};
+		// First tick fires immediately.
+		tick();
+		return function () { stop = true; };
+	}
+
+	// ------------------------------------------------------------------
+	// Resend + cancel
+	// ------------------------------------------------------------------
+	function runResend( btn ) {
+		var campaignId = parseInt( btn.dataset.campaign, 10 );
+		var title      = btn.dataset.title || '';
+		if ( ! campaignId ) {
+			setStatus( 'error', __( 'Invalid campaign id.', 'mpfr' ) );
+			return;
+		}
+		var ok = window.confirm( __( 'Resend every failed email for this campaign through the active ESP? (Runs in background — you can leave this page.)', 'mpfr' ) );
+		if ( ! ok ) return;
+
+		setBusy( btn, true, __( 'Starting…', 'mpfr' ) );
+		setStatus( 'info', __( 'Resending failed emails in the background…', 'mpfr' ) );
+
+		apiFetch( {
+			path: '/mpfr/v1/campaign/' + campaignId + '/resend-failed',
+			method: 'POST',
+			data: { batch_size: 50 }
+		} )
+			.then( function ( response ) {
+				if ( ! response || ! response.success ) {
+					throw new Error( ( response && response.message ) || 'Unknown error' );
+				}
+				if ( response.scheduled ) {
+					// Background: start polling for progress.
+					setStatus( 'info', sprintf( __( 'Resend scheduled (%1$d emails queued). Watching progress…', 'mpfr' ), response.progress && response.progress.total || 0 ) );
+					cards[ campaignId ] = pollProgress( campaignId, title );
+				} else {
+					// Legacy sync response (shouldn't happen with the new flow).
+					setStatus( 'success', response.message || sprintf( __( 'Resent: %d.', 'mpfr' ), response.resent || 0 ) );
+					loadRows();
+				}
+			} )
+			.catch( function ( err ) {
+				setStatus( 'error', sprintf( __( 'Failed: %s', 'mpfr' ), ( err && err.message ) || 'unknown' ) );
+			} )
+			.finally( function () {
+				setBusy( btn, false );
+			} );
+	}
+
+	function cancelResend( campaignId ) {
+		apiFetch( {
+			path: '/mpfr/v1/campaign/' + campaignId + '/resend-cancel',
+			method: 'POST'
+		} )
+			.then( function ( response ) {
+				if ( ! response || ! response.success ) {
+					throw new Error( ( response && response.message ) || 'Cancel failed' );
+				}
+				setStatus( 'warning', __( 'Resend cancelled.', 'mpfr' ) );
+				// The polling loop will pick up the cancelled status on the next tick.
+			} )
+			.catch( function ( err ) {
+				setStatus( 'error', sprintf( __( 'Cancel failed: %s', 'mpfr' ), ( err && err.message ) || 'unknown' ) );
+			} );
+	}
+
+	// ------------------------------------------------------------------
+	// Chunk reset (legacy)
+	// ------------------------------------------------------------------
+	function runChunkReset( btn ) {
+		var batchId = parseInt( btn.dataset.batch, 10 );
+		if ( ! batchId ) {
+			setStatus( 'error', __( 'Invalid batch id.', 'mpfr' ) );
+			return;
+		}
+		var ok = window.confirm( __( 'This will reset ALL chunks of the batch (including completed) and zero the sent/error counters. Continue?', 'mpfr' ) );
+		if ( ! ok ) return;
+
+		setBusy( btn, true, __( 'Resetting…', 'mpfr' ) );
+		setStatus( 'info', __( 'Resetting batch…', 'mpfr' ) );
+
+		apiFetch( { path: '/mpfr/v1/batch/' + batchId + '/reset', method: 'POST' } )
+			.then( function ( response ) {
+				var msg = response && response.message
+					? response.message
+					: sprintf( __( 'Reset: %d chunk(s) rescheduled.', 'mpfr' ), response.chunks_rescheduled || 0 );
+				setStatus( 'success', msg );
+				return loadRows();
+			} )
+			.catch( function ( err ) {
+				setStatus( 'error', sprintf( __( 'Failed: %s', 'mpfr' ), ( err && err.message ) || 'unknown' ) );
+			} )
+			.finally( function () {
+				setBusy( btn, false );
+			} );
+	}
+
+	// ------------------------------------------------------------------
+	// Render
+	// ------------------------------------------------------------------
 	function renderRows( rows ) {
 		if ( ! rows || ! rows.length ) {
 			elTbody.innerHTML = '<tr><td colspan="8" class="mpfr-empty">' +
 				esc( __( 'No campaigns with failed emails.', 'mpfr' ) ) + '</td></tr>';
 			return;
 		}
-
 		elTbody.innerHTML = rows.map( function ( r ) {
 			var failedChunks = parseInt( r.failed_chunks, 10 ) || 0;
 			var retryChunks  = parseInt( r.retry_chunks, 10 )  || 0;
@@ -136,7 +352,7 @@
 						'<span title="processing">', processing, '</span>',
 					'</td>',
 					'<td class="mpfr-col-actions">',
-						'<button type="button" class="button button-primary mpfr-btn mpfr-btn--resend" data-campaign="', campaignId, '">',
+						'<button type="button" class="button button-primary mpfr-btn mpfr-btn--resend" data-campaign="', campaignId, '" data-title="', esc( title ), '">',
 							'<span class="dashicons dashicons-email-alt" aria-hidden="true"></span> ',
 							esc( __( 'Retry Failed Emails', 'mpfr' ) ),
 						'</button> ',
@@ -149,33 +365,21 @@
 		} ).join( '' );
 	}
 
-	/**
-	 * Load the failed campaigns list from our endpoint.
-	 *
-	 * @returns {Promise}
-	 */
 	function loadRows() {
-		setStatus( 'info', __( 'Loading…', 'mpfr' ) );
 		return apiFetch( { path: '/mpfr/v1/failed-campaigns?limit=200' } )
 			.then( function ( response ) {
 				renderRows( response.rows || [] );
-				elStatus.hidden = true;
+				if ( elStatus ) {
+					elStatus.hidden = true;
+				}
 			} )
 			.catch( function ( err ) {
 				elTbody.innerHTML = '<tr><td colspan="8" class="mpfr-error">' +
 					esc( sprintf( __( 'Failed to load: %s', 'mpfr' ), ( err && err.message ) || 'unknown' ) ) +
 					'</td></tr>';
-				setStatus( 'error', sprintf( __( 'Failed to load: %s', 'mpfr' ), ( err && err.message ) || 'unknown' ) );
 			} );
 	}
 
-	/**
-	 * Toggle button state while an action is running.
-	 *
-	 * @param {HTMLButtonElement} btn
-	 * @param {boolean} busy
-	 * @param {string} [busyLabel]
-	 */
 	function setBusy( btn, busy, busyLabel ) {
 		if ( busy ) {
 			btn.dataset.busy = '1';
@@ -189,86 +393,16 @@
 		}
 	}
 
-	/**
-	 * Resend every failed email for a campaign.
-	 */
-	function runResend( btn ) {
-		var campaignId = parseInt( btn.dataset.campaign, 10 );
-		if ( ! campaignId ) {
-			setStatus( 'error', __( 'Invalid campaign id.', 'mpfr' ) );
-			return;
-		}
-
-		var ok = window.confirm( __( 'Resend every failed email for this campaign through the active ESP?', 'mpfr' ) );
-		if ( ! ok ) {
-			return;
-		}
-
-		setBusy( btn, true, __( 'Resending…', 'mpfr' ) );
-		setStatus( 'info', __( 'Resending failed emails…', 'mpfr' ) );
-
-		apiFetch( { path: '/mpfr/v1/campaign/' + campaignId + '/resend-failed', method: 'POST' } )
-			.then( function ( response ) {
-				var msg = response && response.message
-					? response.message
-					: sprintf( __( 'Resent: %d.', 'mpfr' ), response.resent || 0 );
-				setStatus( 'success', msg );
-				return loadRows();
-			} )
-			.catch( function ( err ) {
-				setStatus( 'error', sprintf( __( 'Failed: %s', 'mpfr' ), ( err && err.message ) || 'unknown' ) );
-			} )
-			.finally( function () {
-				setBusy( btn, false );
-			} );
-	}
-
-	/**
-	 * Reset chunks (legacy chunk-based retry, calls /batch/{id}/reset).
-	 */
-	function runChunkReset( btn ) {
-		var batchId = parseInt( btn.dataset.batch, 10 );
-		if ( ! batchId ) {
-			setStatus( 'error', __( 'Invalid batch id.', 'mpfr' ) );
-			return;
-		}
-		var ok = window.confirm( __( 'This will reset ALL chunks of the batch (including completed) and zero the sent/error counters. Continue?', 'mpfr' ) );
-		if ( ! ok ) {
-			return;
-		}
-
-		setBusy( btn, true, __( 'Resetting…', 'mpfr' ) );
-		setStatus( 'info', __( 'Resetting batch…', 'mpfr' ) );
-
-		apiFetch( { path: '/mpfr/v1/batch/' + batchId + '/reset', method: 'POST' } )
-			.then( function ( response ) {
-				var msg = response && response.message
-					? response.message
-					: sprintf( __( 'Reset: %d chunk(s) rescheduled.', 'mpfr' ), response.chunks_rescheduled || 0 );
-				setStatus( 'success', msg );
-				return loadRows();
-			} )
-			.catch( function ( err ) {
-				setStatus( 'error', sprintf( __( 'Failed: %s', 'mpfr' ), ( err && err.message ) || 'unknown' ) );
-			} )
-			.finally( function () {
-				setBusy( btn, false );
-			} );
-	}
-
-	// ----- Event delegation ---------------------------------------------
-
+	// ------------------------------------------------------------------
+	// Event delegation
+	// ------------------------------------------------------------------
 	if ( elRefresh ) {
-		elRefresh.addEventListener( 'click', function () {
-			loadRows();
-		} );
+		elRefresh.addEventListener( 'click', function () { loadRows(); } );
 	}
 
 	elTbody.addEventListener( 'click', function ( e ) {
 		var btn = e.target.closest( 'button.mpfr-btn' );
-		if ( ! btn || btn.dataset.busy === '1' ) {
-			return;
-		}
+		if ( ! btn || btn.dataset.busy === '1' ) return;
 		if ( btn.classList.contains( 'mpfr-btn--resend' ) ) {
 			runResend( btn );
 		} else if ( btn.classList.contains( 'mpfr-btn--reset' ) ) {
@@ -276,14 +410,32 @@
 		}
 	} );
 
-	// Initial load.
+	// ------------------------------------------------------------------
+	// Initial load + periodic refresh
+	// ------------------------------------------------------------------
 	loadRows();
-
-	// Auto-refresh every 30 seconds.
 	setInterval( function () {
-		if ( document.hidden ) {
-			return;
-		}
+		if ( document.hidden ) return;
 		loadRows();
 	}, 30000 );
+
+	// ------------------------------------------------------------------
+	// Resume: on page load, check whether any campaigns have an in-flight
+	// resend (e.g. user navigated away and came back) and re-attach polling.
+	// ------------------------------------------------------------------
+	apiFetch( { path: '/mpfr/v1/failed-campaigns?limit=200' } )
+		.then( function ( response ) {
+			var rows = ( response && response.rows ) || [];
+			var pending = rows.map( function ( r ) { return parseInt( r.id, 10 ) || 0; } ).filter( function ( id ) { return id > 0; } );
+			pending.forEach( function ( cid ) {
+				apiFetch( { path: '/mpfr/v1/campaign/' + cid + '/resend-progress' } )
+					.then( function ( p ) {
+						if ( p && ( p.status === 'running' || p.status === 'starting' ) ) {
+							cards[ cid ] = pollProgress( cid, '' );
+						}
+					} )
+					.catch( function () {} );
+			} );
+		} )
+		.catch( function () {} );
 } )( window.wp, document );
