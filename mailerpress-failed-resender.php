@@ -1,7 +1,7 @@
 <?php
 /**
  * Plugin Name: MailerPress Failed Resender
- * Plugin URI:  https://example.com/mailerpress-failed-resender
+ * Plugin URI:  https://classicmonks.com/
  * Description: Adds a "Retry Failed" submenu under MailerPress that lists every
  *              campaign with failed emails/chunks and exposes a one-click
  *              "Retry Failed" button. The button calls the existing MailerPress
@@ -9,7 +9,8 @@
  *              to reset all failed/retry/processing chunks of a batch.
  *              This plugin does NOT modify the MailerPress source code.
  * Version:     1.0.0
- * Author:      Custom
+ * Author:      Classic Monks
+ * Author URI:  https://classicmonks.com/
  * License:     GPL-2.0-or-later
  * Requires PHP: 7.4
  *
