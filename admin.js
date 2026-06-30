@@ -114,7 +114,10 @@
 			var btn = elTbody.querySelector( 'button.mpfr-btn--hide[data-campaign="' + hiddenCampaigns[i] + '"]' );
 			if ( btn ) {
 				btn.dataset.hidden = 'true';
-				btn.querySelector( '.dashicons' ).className = 'dashicons dashicons-hidden';
+				var icon = btn.querySelector( '.dashicons' );
+				if ( icon ) {
+					icon.className = 'dashicons dashicons-hidden';
+				}
 				btn.title = __( 'Unhide', 'mpfr' );
 			}
 		}
@@ -124,7 +127,10 @@
 			var campaignId = parseInt( allHideBtns[j].dataset.campaign, 10 );
 			if ( hiddenCampaigns.indexOf( campaignId ) === -1 ) {
 				allHideBtns[j].dataset.hidden = 'false';
-				allHideBtns[j].querySelector( '.dashicons' ).className = 'dashicons dashicons-visibility';
+				var icon = allHideBtns[j].querySelector( '.dashicons' );
+				if ( icon ) {
+					icon.className = 'dashicons dashicons-visibility';
+				}
 				allHideBtns[j].title = __( 'Hide', 'mpfr' );
 			}
 		}
