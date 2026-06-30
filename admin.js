@@ -102,10 +102,32 @@
 				hiddenCampaigns = response.hidden_campaigns || [];
 				updateShowHiddenButton();
 				applyHiddenState();
+				updateHideButtons();
 			} )
 			.catch( function ( err ) {
 				console.error( 'Failed to load hidden campaigns:', err );
 			} );
+	}
+
+	function updateHideButtons() {
+		for ( var i = 0; i < hiddenCampaigns.length; i++ ) {
+			var btn = elTbody.querySelector( 'button.mpfr-btn--hide[data-campaign="' + hiddenCampaigns[i] + '"]' );
+			if ( btn ) {
+				btn.dataset.hidden = 'true';
+				btn.querySelector( '.dashicons' ).className = 'dashicons dashicons-hidden';
+				btn.title = __( 'Unhide', 'mpfr' );
+			}
+		}
+		// Reset buttons that are not hidden
+		var allHideBtns = elTbody.querySelectorAll( 'button.mpfr-btn--hide' );
+		for ( var j = 0; j < allHideBtns.length; j++ ) {
+			var campaignId = parseInt( allHideBtns[j].dataset.campaign, 10 );
+			if ( hiddenCampaigns.indexOf( campaignId ) === -1 ) {
+				allHideBtns[j].dataset.hidden = 'false';
+				allHideBtns[j].querySelector( '.dashicons' ).className = 'dashicons dashicons-visibility';
+				allHideBtns[j].title = __( 'Hide', 'mpfr' );
+			}
+		}
 	}
 
 	function hideCampaign( campaignId, btn ) {
@@ -154,6 +176,7 @@
 				}
 				
 				updateShowHiddenButton();
+				updateHideButtons();
 				var statusMessage = isCurrentlyHidden ? __( 'Campaign unhidden.', 'mpfr' ) : __( 'Campaign hidden.', 'mpfr' );
 				setStatus( 'info', statusMessage );
 			} )
@@ -504,9 +527,8 @@
 						'<button type="button" class="button mpfr-btn mpfr-btn--reset" data-batch="', batchPk, '">',
 							esc( __( 'Reset Chunks', 'mpfr' ) ),
 						'</button> ',
-						'<button type="button" class="button button-secondary mpfr-btn mpfr-btn--hide" data-campaign="', campaignId, '">',
-							'<span class="dashicons dashicons-visibility" aria-hidden="true"></span> ',
-							esc( __( 'Hide', 'mpfr' ) ),
+						'<button type="button" class="button button-secondary mpfr-btn mpfr-btn--hide" data-campaign="', campaignId, '" data-hidden="false" title="', esc( __( 'Hide', 'mpfr' ) ), '">',
+							'<span class="dashicons dashicons-visibility" aria-hidden="true"></span>',
 						'</button>',
 					'</td>',
 				'</tr>'
