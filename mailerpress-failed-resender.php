@@ -179,6 +179,13 @@ function mpfr_enqueue_assets( $hook ) {
 				'refresh'         => __( 'Refresh', 'mpfr' ),
 				'reset'           => __( 'Hard Reset Batch', 'mpfr' ),
 				'confirmReset'    => __( 'This will reset ALL chunks of the batch (including completed) and zero the sent/error counters. Continue?', 'mpfr' ),
+				// New strings for hide/show functionality
+				'hide'            => __( 'Hide', 'mpfr' ),
+				'hiding'          => __( 'Hiding…', 'mpfr' ),
+				'showHidden'      => __( 'Show Hidden', 'mpfr' ),
+				'hideHidden'      => __( 'Hide Hidden', 'mpfr' ),
+				'campaignHidden'  => __( 'Campaign hidden.', 'mpfr' ),
+				'hiddenCount'     => __( '(%d)', 'mpfr' ),
 			),
 		)
 	);
