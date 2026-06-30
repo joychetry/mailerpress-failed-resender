@@ -1,0 +1,140 @@
+/* MailerPress Failed Resender — admin styles */
+
+.mpfr-wrap .page-title-action {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	vertical-align: baseline;
+}
+
+.mpfr-wrap .mpfr-status {
+	margin: 12px 0;
+	padding: 8px 12px;
+	border-left: 4px solid #72aee6;
+	background: #f0f6fc;
+	font-size: 13px;
+}
+
+.mpfr-wrap .mpfr-status--success {
+	border-left-color: #00a32a;
+	background: #edfaef;
+}
+
+.mpfr-wrap .mpfr-status--error {
+	border-left-color: #d63638;
+	background: #fcf0f1;
+	color: #1d2327;
+}
+
+.mpfr-wrap .mpfr-status--info {
+	border-left-color: #72aee6;
+	background: #f0f6fc;
+}
+
+.mpfr-wrap .mpfr-table {
+	margin-top: 16px;
+}
+
+.mpfr-wrap .mpfr-table th,
+.mpfr-wrap .mpfr-table td {
+	vertical-align: middle;
+}
+
+.mpfr-wrap .mpfr-col-num {
+	text-align: right;
+	width: 80px;
+	font-variant-numeric: tabular-nums;
+}
+
+.mpfr-wrap .mpfr-col-status {
+	width: 110px;
+}
+
+.mpfr-wrap .mpfr-col-campaign strong {
+	display: block;
+	font-weight: 600;
+}
+
+.mpfr-wrap .mpfr-meta {
+	color: #50575e;
+	font-size: 12px;
+	margin-top: 2px;
+}
+
+.mpfr-wrap .mpfr-col-errors {
+	color: #d63638;
+	font-weight: 600;
+}
+
+.mpfr-wrap .mpfr-col-actions {
+	width: 260px;
+	white-space: nowrap;
+}
+
+.mpfr-wrap .mpfr-btn {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+}
+
+.mpfr-wrap .mpfr-btn .dashicons {
+	font-size: 16px;
+	width: 16px;
+	height: 16px;
+	line-height: 1.5;
+}
+
+.mpfr-wrap .mpfr-loading,
+.mpfr-wrap .mpfr-empty {
+	color: #50575e;
+	text-align: center;
+	font-style: italic;
+}
+
+.mpfr-wrap .mpfr-error {
+	color: #d63638;
+	font-weight: 600;
+	text-align: center;
+}
+
+.mpfr-wrap .mpfr-badge {
+	display: inline-block;
+	padding: 2px 8px;
+	border-radius: 3px;
+	font-size: 11px;
+	font-weight: 600;
+	text-transform: uppercase;
+	letter-spacing: 0.5px;
+	background: #f0f0f1;
+	color: #50575e;
+}
+
+.mpfr-wrap .mpfr-badge--failed {
+	background: #fcf0f1;
+	color: #d63638;
+}
+
+.mpfr-wrap .mpfr-badge--error {
+	background: #fcf0f1;
+	color: #d63638;
+}
+
+.mpfr-wrap .mpfr-badge--in_progress {
+	background: #f0f6fc;
+	color: #2271b1;
+}
+
+.mpfr-wrap .mpfr-badge--sent {
+	background: #edfaef;
+	color: #00a32a;
+}
+
+.mpfr-wrap .mpfr-badge--scheduled {
+	background: #fcf9e8;
+	color: #8a6d00;
+}
+
+.mpfr-wrap .mpfr-badge--pending {
+	background: #f0f0f1;
+	color: #50575e;
+}
